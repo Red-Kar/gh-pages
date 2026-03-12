@@ -1,248 +1,143 @@
-Oui, c’est une bonne façon de faire.
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Secure Message</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 900px;
+      margin: 40px auto;
+      padding: 0 20px;
+    }
+    input, button {
+      padding: 10px;
+      font-size: 16px;
+    }
+    input {
+      width: 320px;
+    }
+    button {
+      cursor: pointer;
+      margin-left: 8px;
+    }
+    #output {
+      margin-top: 24px;
+      padding: 16px;
+      border: 1px solid #ccc;
+      border-radius: 8px;
+      white-space: pre-wrap;
+      min-height: 120px;
+    }
+    #meta {
+      color: #666;
+      margin-bottom: 12px;
+    }
+    .error {
+      color: #b00020;
+    }
+  </style>
+</head>
+<body>
+  <h1>Secure Message</h1>
+  <div id="meta">Loading metadata...</div>
 
-Ce que tu m’as donné est suffisant pour démarrer un pré-design. On n’est pas encore au niveau implémentation, mais on a déjà assez pour cadrer une solution solide autour de l’idée suivante :
+  <input id="passphrase" type="password" placeholder="Enter passphrase" />
+  <button id="decryptBtn">Decrypt</button>
 
-un batch runner Java autonome qui :
-	•	reçoit des paramètres en ligne de commande,
-	•	déclenche un job distant via API REST,
-	•	interroge périodiquement l’état du job,
-	•	écrit les logs sur stdout,
-	•	termine avec un exit code clair pour le scheduler,
-	•	reste découplé de l’identité métier réellement utilisée par le job.
+  <div id="output"></div>
 
-À partir de tes notes, je vois 4 blocs à concevoir.
+  <script>
+    let encryptedPayload = null;
 
-1. Vision cible
+    async function loadMessage() {
+      const response = await fetch(`message.json?v=${Date.now()}`, { cache: 'no-store' });
+      if (!response.ok) {
+        throw new Error("Unable to load message.json");
+      }
+      encryptedPayload = await response.json();
+      document.getElementById("meta").textContent =
+        `Title: ${encryptedPayload.title || "N/A"} | Created: ${encryptedPayload.createdAt || "N/A"}`;
+    }
 
-Je te proposerais de structurer ça comme suit :
+    function base64ToBytes(base64) {
+      return Uint8Array.from(atob(base64), c => c.charCodeAt(0));
+    }
 
-Scheduler / Ctrl-M
-→ lance le Batch Runner
-→ qui appelle ClaimCenter / Job Manager API
-→ récupère un jobExecutionId
-→ boucle de polling sur une Status API
-→ écrit les traces
-→ retourne un exit code.
+    async function deriveKey(passphrase, saltBytes) {
+      const encoder = new TextEncoder();
+      const keyMaterial = await crypto.subtle.importKey(
+        "raw",
+        encoder.encode(passphrase),
+        "PBKDF2",
+        false,
+        ["deriveKey"]
+      );
 
-Donc le batch runner n’exécute pas le traitement lui-même.
-Il agit surtout comme orchestrateur léger en CLI.
+      return crypto.subtle.deriveKey(
+        {
+          name: "PBKDF2",
+          salt: saltBytes,
+          iterations: 250000,
+          hash: "SHA-256"
+        },
+        keyMaterial,
+        {
+          name: "AES-GCM",
+          length: 256
+        },
+        false,
+        ["decrypt"]
+      );
+    }
 
-⸻
+    async function decryptMessage() {
+      const output = document.getElementById("output");
+      output.className = "";
+      output.textContent = "Decrypting...";
 
-2. Sujets d’architecture à traiter
+      try {
+        if (!encryptedPayload) {
+          throw new Error("Message not loaded");
+        }
 
-A. Contrat d’entrée du batch runner
+        const passphrase = document.getElementById("passphrase").value;
+        if (!passphrase) {
+          throw new Error("Passphrase is required");
+        }
 
-Il faut figer très tôt :
-	•	nom du job,
-	•	identités / contexte d’exécution,
-	•	paramètres métier,
-	•	paramètres techniques,
-	•	timeout global,
-	•	intervalle de polling,
-	•	nombre max de reprises,
-	•	mode de reprise éventuel.
+        const salt = base64ToBytes(encryptedPayload.salt);
+        const iv = base64ToBytes(encryptedPayload.iv);
+        const ciphertext = base64ToBytes(encryptedPayload.ciphertext);
 
-Exemple conceptuel :
-	•	jobName
-	•	correlationId
-	•	requestedBy
-	•	resumeMode
-	•	pollIntervalSeconds
-	•	timeoutMinutes
-	•	paramètres spécifiques au job
+        const key = await deriveKey(passphrase, salt);
 
-L’idée importante : séparer paramètres standards et paramètres métier spécifiques.
+        const decrypted = await crypto.subtle.decrypt(
+          {
+            name: "AES-GCM",
+            iv: iv
+          },
+          key,
+          ciphertext
+        );
 
-⸻
+        const decoder = new TextDecoder();
+        output.textContent = decoder.decode(decrypted);
+      } catch (e) {
+        output.className = "error";
+        output.textContent = "Unable to decrypt. Wrong passphrase or invalid payload.";
+      }
+    }
 
-B. Modèle d’exécution
+    document.getElementById("decryptBtn").addEventListener("click", decryptMessage);
 
-Je te conseille ce flow :
-	1.	validation des arguments
-	2.	chargement config
-	3.	authentification technique
-	4.	appel API “start job”
-	5.	récupération identifiant d’exécution
-	6.	boucle de polling
-	7.	mapping du statut final vers exit code
-	8.	fin propre avec logs structurés
-
-Statuts à prévoir :
-	•	PENDING
-	•	RUNNING
-	•	SUCCEEDED
-	•	FAILED
-	•	CANCELLED
-	•	UNKNOWN
-	•	TIMEOUT
-
-⸻
-
-C. Sécurité / identité
-
-C’est un point très important dans tes notes.
-
-Ta remarque est bonne : l’identité utilisée pour déclencher le job ne devrait pas forcément être l’identité métier utilisée dans les transactions internes du job.
-
-Je te proposerais ce principe :
-	•	le batch runner utilise une identity technique d’orchestration
-	•	l’application distante exécute le job avec une identity de service métier dédiée
-	•	la base / schéma SQL utilise un modèle RBAC séparé
-	•	rôle admin pour déploiement / migrations
-	•	rôle writer ou executor pour runtime
-	•	le compte qui déploie la BD ≠ le compte qui exécute le batch
-
-Ça évite de donner trop de privilèges au batch runner.
-
-⸻
-
-D. Déploiement / Spring Batch / BD
-
-D’après la 2e capture, il faut aussi cadrer :
-	•	création du repo,
-	•	structure projet,
-	•	packaging,
-	•	modèle de déploiement,
-	•	base Spring Batch séparée,
-	•	paramètres de connexion Azure SQL,
-	•	SSL,
-	•	RBAC du schéma.
-
-Là, je te recommanderais fortement :
-	•	un repo dédié batch-runner
-	•	un repo/job Spring Batch séparé si la logique métier est importante
-	•	ou au minimum deux modules distincts
-	•	batch-runner-cli
-	•	batch-job-app
-
-Et pour la BD Spring Batch :
-	•	idéalement métadonnées Spring Batch isolées
-	•	compte de service applicatif limité
-	•	migrations gérées séparément du runtime
-
-⸻
-
-3. Design que je te proposerais
-
-Je partirais sur ces composants :
-
-Dans le batch runner
-	•	CommandLineEntryPoint
-	•	ArgumentParser
-	•	JobRequestFactory
-	•	JobLauncherClient
-	•	JobStatusClient
-	•	PollingOrchestrator
-	•	ExitCodeMapper
-	•	StdoutLogger
-	•	AuthTokenProvider
-	•	RetryPolicy
-	•	RunnerConfiguration
-
-Côté domaine
-	•	BatchJobRequest
-	•	BatchJobHandle
-	•	BatchJobStatus
-	•	BatchExecutionResult
-
-Côté infra
-	•	client REST ClaimCenter
-	•	configuration SSL
-	•	provider d’authentification
-	•	mapping erreurs HTTP / timeout / retry
-
-⸻
-
-4. UML à produire ensuite
-
-Oui, on peut viser un livrable PlantUML.
-Je te proposerais même 4 diagrammes, pas un seul :
-	1.	Diagramme de contexte
-	•	Scheduler
-	•	Batch Runner
-	•	ClaimCenter / Job Manager
-	•	Status API
-	•	Azure SQL / Spring Batch metadata
-	2.	Diagramme de séquence
-	•	lancement
-	•	start job
-	•	polling
-	•	fin avec exit code
-	3.	Diagramme de classes
-	•	composants du runner
-	•	objets métier
-	•	interfaces principales
-	4.	Diagramme de déploiement
-	•	scheduler
-	•	app Java
-	•	API distante
-	•	base SQL
-	•	secrets / identité / SSL
-
-Franchement, c’est la bonne base pour sécuriser le design avant dev.
-
-⸻
-
-5. Les questions qu’il faut trancher avant que je te génère le PlantUML
-
-J’ai besoin que tu me répondes à ça, sinon je vais devoir faire des hypothèses :
-
-Fonctionnel
-	1.	Est-ce que le batch runner lance un seul type de job générique, ou plusieurs jobs avec un paramètre jobName ?
-	2.	Est-ce que les paramètres spécifiques du job sont passés :
-	•	en CLI,
-	•	en JSON,
-	•	via fichier,
-	•	ou mixte ?
-	3.	Est-ce qu’un job peut être repris si déjà commencé ?
-
-Technique
-	4.	Le polling se fait sur une API REST dédiée status, c’est bien ça ?
-	5.	L’API de lancement retourne quoi exactement :
-	•	un jobId,
-	•	un executionId,
-	•	une URL de suivi ?
-	6.	Est-ce que ClaimCenter expose déjà ces APIs ou c’est à construire ?
-
-Sécurité
-	7.	Comment l’authentification se fera :
-	•	client credentials OAuth2,
-	•	certificat,
-	•	basic auth,
-	•	autre ?
-	8.	Veux-tu que le batch runner transporte uniquement une identité technique, sans identité utilisateur finale ?
-	9.	Le job côté serveur doit-il “impersonate” une autre identité ?
-
-Exécution / Ops
-	10.	Quels exit codes veux-tu retourner au scheduler ?
-Exemple :
-
-	•	0 succès
-	•	1 échec métier
-	•	2 erreur technique
-	•	3 timeout
-
-	11.	Veux-tu un timeout global par job ?
-	12.	Veux-tu des retries sur :
-
-	•	appel start,
-	•	appel status,
-	•	les deux ?
-
-Spring Batch / BD
-	13.	Le volet Spring Batch est-il dans la même application que l’API distante ou dans une app séparée ?
-	14.	Veux-tu une BD Spring Batch dédiée ou juste un schéma dédié ?
-	15.	Le déploiement BD sera-t-il fait par pipeline séparée ?
-
-⸻
-
-6. Ce que je te propose comme suite
-
-La meilleure suite, c’est :
-tu réponds à mes 15 questions, même brièvement, et ensuite je te fournis :
-	•	une proposition d’architecture claire,
-	•	les décisions de design,
-	•	puis le PlantUML complet prêt à copier.
-
-On peut faire ça proprement du premier coup.
+    loadMessage().catch(err => {
+      const output = document.getElementById("output");
+      document.getElementById("meta").textContent = "Failed to load message metadata";
+      output.className = "error";
+      output.textContent = err.message;
+    });
+  </script>
+</body>
+</html>
