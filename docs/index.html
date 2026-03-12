@@ -1,1 +1,248 @@
-toto
+Oui, c’est une bonne façon de faire.
+
+Ce que tu m’as donné est suffisant pour démarrer un pré-design. On n’est pas encore au niveau implémentation, mais on a déjà assez pour cadrer une solution solide autour de l’idée suivante :
+
+un batch runner Java autonome qui :
+	•	reçoit des paramètres en ligne de commande,
+	•	déclenche un job distant via API REST,
+	•	interroge périodiquement l’état du job,
+	•	écrit les logs sur stdout,
+	•	termine avec un exit code clair pour le scheduler,
+	•	reste découplé de l’identité métier réellement utilisée par le job.
+
+À partir de tes notes, je vois 4 blocs à concevoir.
+
+1. Vision cible
+
+Je te proposerais de structurer ça comme suit :
+
+Scheduler / Ctrl-M
+→ lance le Batch Runner
+→ qui appelle ClaimCenter / Job Manager API
+→ récupère un jobExecutionId
+→ boucle de polling sur une Status API
+→ écrit les traces
+→ retourne un exit code.
+
+Donc le batch runner n’exécute pas le traitement lui-même.
+Il agit surtout comme orchestrateur léger en CLI.
+
+⸻
+
+2. Sujets d’architecture à traiter
+
+A. Contrat d’entrée du batch runner
+
+Il faut figer très tôt :
+	•	nom du job,
+	•	identités / contexte d’exécution,
+	•	paramètres métier,
+	•	paramètres techniques,
+	•	timeout global,
+	•	intervalle de polling,
+	•	nombre max de reprises,
+	•	mode de reprise éventuel.
+
+Exemple conceptuel :
+	•	jobName
+	•	correlationId
+	•	requestedBy
+	•	resumeMode
+	•	pollIntervalSeconds
+	•	timeoutMinutes
+	•	paramètres spécifiques au job
+
+L’idée importante : séparer paramètres standards et paramètres métier spécifiques.
+
+⸻
+
+B. Modèle d’exécution
+
+Je te conseille ce flow :
+	1.	validation des arguments
+	2.	chargement config
+	3.	authentification technique
+	4.	appel API “start job”
+	5.	récupération identifiant d’exécution
+	6.	boucle de polling
+	7.	mapping du statut final vers exit code
+	8.	fin propre avec logs structurés
+
+Statuts à prévoir :
+	•	PENDING
+	•	RUNNING
+	•	SUCCEEDED
+	•	FAILED
+	•	CANCELLED
+	•	UNKNOWN
+	•	TIMEOUT
+
+⸻
+
+C. Sécurité / identité
+
+C’est un point très important dans tes notes.
+
+Ta remarque est bonne : l’identité utilisée pour déclencher le job ne devrait pas forcément être l’identité métier utilisée dans les transactions internes du job.
+
+Je te proposerais ce principe :
+	•	le batch runner utilise une identity technique d’orchestration
+	•	l’application distante exécute le job avec une identity de service métier dédiée
+	•	la base / schéma SQL utilise un modèle RBAC séparé
+	•	rôle admin pour déploiement / migrations
+	•	rôle writer ou executor pour runtime
+	•	le compte qui déploie la BD ≠ le compte qui exécute le batch
+
+Ça évite de donner trop de privilèges au batch runner.
+
+⸻
+
+D. Déploiement / Spring Batch / BD
+
+D’après la 2e capture, il faut aussi cadrer :
+	•	création du repo,
+	•	structure projet,
+	•	packaging,
+	•	modèle de déploiement,
+	•	base Spring Batch séparée,
+	•	paramètres de connexion Azure SQL,
+	•	SSL,
+	•	RBAC du schéma.
+
+Là, je te recommanderais fortement :
+	•	un repo dédié batch-runner
+	•	un repo/job Spring Batch séparé si la logique métier est importante
+	•	ou au minimum deux modules distincts
+	•	batch-runner-cli
+	•	batch-job-app
+
+Et pour la BD Spring Batch :
+	•	idéalement métadonnées Spring Batch isolées
+	•	compte de service applicatif limité
+	•	migrations gérées séparément du runtime
+
+⸻
+
+3. Design que je te proposerais
+
+Je partirais sur ces composants :
+
+Dans le batch runner
+	•	CommandLineEntryPoint
+	•	ArgumentParser
+	•	JobRequestFactory
+	•	JobLauncherClient
+	•	JobStatusClient
+	•	PollingOrchestrator
+	•	ExitCodeMapper
+	•	StdoutLogger
+	•	AuthTokenProvider
+	•	RetryPolicy
+	•	RunnerConfiguration
+
+Côté domaine
+	•	BatchJobRequest
+	•	BatchJobHandle
+	•	BatchJobStatus
+	•	BatchExecutionResult
+
+Côté infra
+	•	client REST ClaimCenter
+	•	configuration SSL
+	•	provider d’authentification
+	•	mapping erreurs HTTP / timeout / retry
+
+⸻
+
+4. UML à produire ensuite
+
+Oui, on peut viser un livrable PlantUML.
+Je te proposerais même 4 diagrammes, pas un seul :
+	1.	Diagramme de contexte
+	•	Scheduler
+	•	Batch Runner
+	•	ClaimCenter / Job Manager
+	•	Status API
+	•	Azure SQL / Spring Batch metadata
+	2.	Diagramme de séquence
+	•	lancement
+	•	start job
+	•	polling
+	•	fin avec exit code
+	3.	Diagramme de classes
+	•	composants du runner
+	•	objets métier
+	•	interfaces principales
+	4.	Diagramme de déploiement
+	•	scheduler
+	•	app Java
+	•	API distante
+	•	base SQL
+	•	secrets / identité / SSL
+
+Franchement, c’est la bonne base pour sécuriser le design avant dev.
+
+⸻
+
+5. Les questions qu’il faut trancher avant que je te génère le PlantUML
+
+J’ai besoin que tu me répondes à ça, sinon je vais devoir faire des hypothèses :
+
+Fonctionnel
+	1.	Est-ce que le batch runner lance un seul type de job générique, ou plusieurs jobs avec un paramètre jobName ?
+	2.	Est-ce que les paramètres spécifiques du job sont passés :
+	•	en CLI,
+	•	en JSON,
+	•	via fichier,
+	•	ou mixte ?
+	3.	Est-ce qu’un job peut être repris si déjà commencé ?
+
+Technique
+	4.	Le polling se fait sur une API REST dédiée status, c’est bien ça ?
+	5.	L’API de lancement retourne quoi exactement :
+	•	un jobId,
+	•	un executionId,
+	•	une URL de suivi ?
+	6.	Est-ce que ClaimCenter expose déjà ces APIs ou c’est à construire ?
+
+Sécurité
+	7.	Comment l’authentification se fera :
+	•	client credentials OAuth2,
+	•	certificat,
+	•	basic auth,
+	•	autre ?
+	8.	Veux-tu que le batch runner transporte uniquement une identité technique, sans identité utilisateur finale ?
+	9.	Le job côté serveur doit-il “impersonate” une autre identité ?
+
+Exécution / Ops
+	10.	Quels exit codes veux-tu retourner au scheduler ?
+Exemple :
+
+	•	0 succès
+	•	1 échec métier
+	•	2 erreur technique
+	•	3 timeout
+
+	11.	Veux-tu un timeout global par job ?
+	12.	Veux-tu des retries sur :
+
+	•	appel start,
+	•	appel status,
+	•	les deux ?
+
+Spring Batch / BD
+	13.	Le volet Spring Batch est-il dans la même application que l’API distante ou dans une app séparée ?
+	14.	Veux-tu une BD Spring Batch dédiée ou juste un schéma dédié ?
+	15.	Le déploiement BD sera-t-il fait par pipeline séparée ?
+
+⸻
+
+6. Ce que je te propose comme suite
+
+La meilleure suite, c’est :
+tu réponds à mes 15 questions, même brièvement, et ensuite je te fournis :
+	•	une proposition d’architecture claire,
+	•	les décisions de design,
+	•	puis le PlantUML complet prêt à copier.
+
+On peut faire ça proprement du premier coup.
