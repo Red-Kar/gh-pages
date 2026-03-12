@@ -138,6 +138,13 @@
       output.className = "error";
       output.textContent = err.message;
     });
+
+    document.getElementById("passphrase").addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        decryptMessage();
+      }
+    });
   </script>
 </body>
 </html>
